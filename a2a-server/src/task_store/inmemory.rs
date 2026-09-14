@@ -5,7 +5,13 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
+use super::apply_history_length;
 use super::store::{TaskStore, TaskVersion};
+
+/// Default page size when the client does not request one (or requests <= 0).
+const DEFAULT_PAGE_SIZE: usize = 50;
+/// Upper bound on the page size to prevent unbounded responses.
+const MAX_PAGE_SIZE: usize = 100;
 
 struct StoredEntry {
     task: Task,
@@ -85,18 +91,22 @@ impl TaskStore for InMemoryTaskStore {
 
         // Apply pagination
         let page_size = match req.page_size {
-            Some(size) if size > 0 => size as usize,
-            _ => 50,
+            Some(size) if size > 0 => (size as usize).min(MAX_PAGE_SIZE),
+            _ => DEFAULT_PAGE_SIZE,
         };
         let start = if let Some(ref token) = req.page_token {
             // Simple offset-based pagination
-            token.parse::<usize>().unwrap_or(0)
+            token
+                .parse::<usize>()
+                .map_err(|_| A2AError::invalid_params("invalid page token"))?
         } else {
             0
         };
 
         let total_size = tasks.len();
-        let end = (start + page_size).min(total_size);
+        // Make sure start is within bounds
+        let start = start.min(total_size);
+        let end = start.saturating_add(page_size).min(total_size);
         let page = tasks[start..end].to_vec();
 
         let next_page_token = if end < total_size {
@@ -105,21 +115,10 @@ impl TaskStore for InMemoryTaskStore {
             None
         };
 
-        // Apply history length truncation
         let page = page
             .into_iter()
             .map(|mut task| {
-                if let Some(ref hl) = req.history_length {
-                    let hl = *hl as usize;
-                    if let Some(ref mut history) = task.history {
-                        if hl == 0 {
-                            *history = Vec::new();
-                        } else if history.len() > hl {
-                            let start = history.len() - hl;
-                            *history = history[start..].to_vec();
-                        }
-                    }
-                }
+                apply_history_length(&mut task, req.history_length);
                 task
             })
             .collect();
@@ -344,5 +343,127 @@ mod tests {
         };
         let resp = store.list(&req).await.unwrap();
         assert_eq!(resp.tasks[0].history.as_ref().unwrap().len(), 1);
+
+        let empty = store
+            .list(&ListTasksRequest {
+                history_length: Some(-1),
+                ..req
+            })
+            .await
+            .unwrap();
+        assert!(empty.tasks[0].history.as_ref().unwrap().is_empty());
+    }
+
+    fn make_task_with_history(id: &str, messages: Vec<&str>) -> Task {
+        let mut task = make_task(id, "c1", TaskState::Working);
+        task.history = Some(
+            messages
+                .into_iter()
+                .map(|m| Message::new(Role::User, vec![Part::text(m)]))
+                .collect(),
+        );
+        task
+    }
+
+    #[tokio::test]
+    async fn test_list_negative_history_length_returns_empty_history() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(make_task_with_history("t1", vec!["1", "2", "3"]))
+            .await
+            .unwrap();
+
+        let req = ListTasksRequest {
+            context_id: None,
+            status: None,
+            page_size: None,
+            page_token: None,
+            history_length: Some(-1),
+            status_timestamp_after: None,
+            include_artifacts: None,
+            tenant: None,
+        };
+        let resp = store.list(&req).await.unwrap();
+        assert_eq!(resp.tasks.len(), 1);
+        assert_eq!(resp.tasks[0].history.as_ref().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_page_size_is_capped() {
+        let store = InMemoryTaskStore::new();
+        for i in 0..150 {
+            store
+                .create(make_task(&format!("t{i:03}"), "c1", TaskState::Submitted))
+                .await
+                .unwrap();
+        }
+
+        let req = ListTasksRequest {
+            context_id: None,
+            status: None,
+            page_size: Some(1000),
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: None,
+            tenant: None,
+        };
+        let resp = store.list(&req).await.unwrap();
+        assert_eq!(resp.tasks.len(), 100);
+        assert_eq!(resp.page_size, 100);
+        assert_eq!(resp.total_size, 150);
+    }
+
+    #[tokio::test]
+    async fn test_list_invalid_page_token_errors() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(make_task("t1", "c1", TaskState::Submitted))
+            .await
+            .unwrap();
+
+        let req = ListTasksRequest {
+            context_id: None,
+            status: None,
+            page_size: None,
+            page_token: Some("not-a-number".into()),
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: None,
+            tenant: None,
+        };
+        let result = store.list(&req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_list_out_of_range_page_token_returns_empty_page() {
+        let store = InMemoryTaskStore::new();
+        for i in 0..3 {
+            store
+                .create(make_task(&format!("t{i}"), "c1", TaskState::Submitted))
+                .await
+                .unwrap();
+        }
+
+        let req = ListTasksRequest {
+            context_id: None,
+            status: None,
+            page_size: None,
+            page_token: Some("999".to_string()),
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: None,
+            tenant: None,
+        };
+        let resp = store.list(&req).await.unwrap();
+
+        assert!(resp.tasks.is_empty());
+        assert!(
+            resp.next_page_token.is_empty(),
+            "must not hand back another token"
+        );
+        assert_eq!(resp.total_size, 3);
     }
 }

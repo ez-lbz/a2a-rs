@@ -8,6 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege by default; jobs that need more raise it themselves.
+permissions:
+  contents: read
+
 jobs:
   build-test:
     name: Build and test (${{ matrix.os }})
@@ -19,17 +23,28 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           components: clippy, rustfmt
 
       - name: Install just
-        uses: taiki-e/install-action@80779d0b81222e7a5d0c5751d3c2537d4a36f556 # v2
+        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2
         with:
           tool: just
+
+      - name: Check lockfile is up to date
+        # `--locked` fails if Cargo.lock would need changing. The release
+        # workflows already build with `--locked`, so a lockfile that drifts
+        # on main breaks every pull request's release-binary job.
+        #
+        # `shell: bash` because the windows runner defaults to pwsh, where
+        # `/dev/null` is an ordinary path and the redirect fails on the
+        # missing `C:\dev` directory.
+        shell: bash
+        run: cargo metadata --locked --format-version 1 > /dev/null
 
       - name: Check compilation
         run: just check-compile
