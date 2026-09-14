@@ -79,6 +79,8 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("data:"));
+        // The boundary no longer sanitizes: an error arriving on the
+        // executor's event stream keeps its own message.
         assert!(body_str.contains("fail"));
     }
 
@@ -105,6 +107,8 @@ mod tests {
         let resp = sse.into_response();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
+        // The boundary no longer sanitizes: an error arriving on the
+        // executor's event stream keeps its own message.
         assert!(body_str.contains("fail"));
         assert!(body_str.contains("error"));
     }
