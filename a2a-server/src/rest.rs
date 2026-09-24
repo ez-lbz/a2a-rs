@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use std::sync::Arc;
 
@@ -115,6 +116,9 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
             REST_EXTENDED_AGENT_CARD_LEGACY_PATH,
             axum::routing::get(handle_get_extended_agent_card::<H>),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::jsonrpc::MAX_REQUEST_BODY_BYTES,
+        ))
         .with_state(state)
 }
 
@@ -213,9 +217,15 @@ async fn handle_list_tasks<H: RequestHandler>(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
-    let status = query
-        .status
-        .and_then(|s| serde_json::from_value::<TaskState>(serde_json::Value::String(s)).ok());
+    let status = match query.status {
+        Some(s) => match serde_json::from_value::<TaskState>(serde_json::Value::String(s)) {
+            Ok(state) => Some(state),
+            Err(_) => {
+                return rest_error_response(A2AError::invalid_params("invalid status filter"));
+            }
+        },
+        None => None,
+    };
     let req = ListTasksRequest {
         context_id: query.context_id,
         status,
@@ -388,19 +398,21 @@ async fn handle_get_extended_agent_card<H: RequestHandler>(
 fn protojson_json_response<T: ProtoJsonPayload>(value: &T) -> axum::response::Response {
     match protojson_conv::to_value(value) {
         Ok(payload) => Json(payload).into_response(),
-        Err(e) => rest_error_response(A2AError::internal(format!(
+        Err(e) => rest_error_response(crate::sanitized_internal_error(format!(
             "failed to serialize ProtoJSON payload: {e}"
         ))),
     }
 }
 
-fn protojson_stream(
-    stream: BoxStream<'static, Result<StreamResponse, A2AError>>,
+fn protojson_stream<T: ProtoJsonPayload + 'static>(
+    stream: BoxStream<'static, Result<T, A2AError>>,
 ) -> BoxStream<'static, Result<Value, A2AError>> {
     Box::pin(stream.map(|item| {
         item.and_then(|value| {
             protojson_conv::to_value(&value).map_err(|e| {
-                A2AError::internal(format!("failed to serialize ProtoJSON stream payload: {e}"))
+                crate::sanitized_internal_error(format!(
+                    "failed to serialize ProtoJSON stream payload: {e}"
+                ))
             })
         })
     }))
@@ -767,6 +779,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rest_error_response_boundary_does_not_rewrite_internal_errors() {
+        // The boundary no longer sanitizes: an INTERNAL_ERROR raised by the
+        // executor (or any handler-layer fault) keeps its message, because
+        // the boundary cannot tell an agent's own failure report from a
+        // server fault. Sanitization now happens at the raise site via
+        // `sanitized_internal_error`.
+        let resp = rest_error_response(A2AError::internal("agent-reported failure detail"));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["message"], "agent-reported failure detail");
+    }
+
+    #[test]
+    fn test_sanitized_internal_error_hides_server_side_detail() {
+        let err = crate::sanitized_internal_error("serde fault at /etc/server/keys.pem");
+        assert_eq!(err.code, a2a::error_code::INTERNAL_ERROR);
+        assert_eq!(err.message, "Internal error");
+        assert!(!err.message.contains("/etc/server/keys.pem"));
+
+        // Non-internal errors keep their message (client-validation feedback).
+        let resp = rest_error_response(A2AError::task_not_found("t1"));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A `ProtoJsonPayload` whose proto and ProtoJSON types disagree, so the
+    /// transcode step in `protojson_conv::to_value` always fails.
+    struct UnserializablePayload;
+
+    impl protojson_conv::ProtoJsonPayload for UnserializablePayload {
+        type Proto = a2a_pb::proto::Task;
+        type ProtoJson = a2a_pb::protojson::Task;
+
+        fn to_proto(_value: &Self) -> Self::Proto {
+            // An out-of-range enum discriminant survives encoding but fails
+            // prost's decode in the transcode step.
+            a2a_pb::proto::Task {
+                status: Some(a2a_pb::proto::TaskStatus {
+                    state: 9999,
+                    message: None,
+                    timestamp: None,
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn try_from_proto(
+            _value: &Self::Proto,
+        ) -> Result<Self, a2a_pb::protojson_conv::ProtoJsonPayloadError> {
+            Ok(Self)
+        }
+    }
+
+    #[test]
+    fn test_unserializable_payload_double_round_trips() {
+        // Keeps the fixture's decode side exercised; the fault lives in
+        // `to_proto`, so `to_value` fails while the type stays constructible.
+        let proto = <UnserializablePayload as protojson_conv::ProtoJsonPayload>::to_proto(
+            &UnserializablePayload,
+        );
+        assert!(
+            <UnserializablePayload as protojson_conv::ProtoJsonPayload>::try_from_proto(&proto)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serialization_fault_is_sanitized_at_the_raise_site() {
+        // A server-side ProtoJSON fault must not leak serializer internals,
+        // so the raise site substitutes the generic message while logging the
+        // real cause.
+        let resp = protojson_json_response(&UnserializablePayload);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["message"], "Internal error");
+    }
+
+    #[tokio::test]
+    async fn test_stream_serialization_fault_is_sanitized_at_the_raise_site() {
+        // Same fault on the streaming path: the executor-facing stream yields
+        // a sanitized INTERNAL_ERROR rather than the serializer detail.
+        let stream: BoxStream<'static, Result<UnserializablePayload, A2AError>> =
+            Box::pin(futures::stream::iter(vec![Ok(UnserializablePayload)]));
+        let mut mapped = protojson_stream(stream);
+        let item = mapped.next().await.expect("one item");
+        let err = item.expect_err("transcode must fail");
+        assert_eq!(err.code, a2a::error_code::INTERNAL_ERROR);
+        assert_eq!(err.message, "Internal error");
+    }
+
+    #[tokio::test]
     async fn test_rest_error_response_merges_error_info_metadata() {
         let existing_info = TypedDetail::error_info(
             "TASK_NOT_FOUND",
@@ -948,12 +1052,27 @@ mod tests {
     async fn test_list_tasks_with_query_params() {
         let app = make_app();
         let req = Request::builder()
-            .uri("/tasks?contextId=c1&pageSize=5&pageToken=tok&historyLength=3&includeArtifacts=true&statusTimestampAfter=2025-01-01T00:00:00Z")
+            .uri("/tasks?contextId=c1&pageSize=5&pageToken=0&historyLength=3&includeArtifacts=true&statusTimestampAfter=2025-01-01T00:00:00Z")
             .method("GET")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_invalid_status_returns_bad_request() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/tasks?status=invalid")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["message"], "invalid status filter");
     }
 
     #[tokio::test]
@@ -1272,5 +1391,23 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // Each make_app() creates a new store, so this will be not found
         assert!(resp.status() == StatusCode::OK || resp.status() == StatusCode::NOT_FOUND);
+    }
+
+    /// The REST binding is bounded by the same limit as JSON-RPC: an
+    /// oversized body is rejected at the framework boundary, before any
+    /// handler runs.
+    #[tokio::test]
+    async fn test_request_body_over_the_limit_is_rejected() {
+        let app = make_app();
+        let oversized = Body::from("x".repeat(crate::jsonrpc::MAX_REQUEST_BODY_BYTES + 1));
+        let req = Request::builder()
+            .uri(REST_SEND_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(oversized)
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

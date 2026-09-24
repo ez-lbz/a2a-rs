@@ -1,24 +1,60 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 pub mod agent_card;
 pub mod executor;
 pub mod handler;
 pub mod jsonrpc;
 pub mod middleware;
+pub mod pagination;
 pub mod push;
 pub mod rest;
 pub mod sse;
 pub mod task_store;
+
+// Push-URL validation internals reached by the fuzz target in fuzz/ — see
+// #238. Thin wrappers, not re-exports: the originals stay crate-private.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz_support {
+    use a2a::A2AError;
+
+    pub fn validate_push_url(url: &str) -> Result<(), A2AError> {
+        crate::push::sender::validate_push_url(url)
+    }
+
+    pub fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+        crate::push::sender::is_blocked_ip(ip)
+    }
+}
 
 #[cfg(any(feature = "rustls-tls", feature = "rustls-no-provider"))]
 pub mod tls;
 
 pub use agent_card::{AgentCardProducer, StaticAgentCard, WELL_KNOWN_AGENT_CARD_PATH};
 pub use executor::{AgentExecutor, ExecutorContext};
-pub use handler::{DefaultRequestHandler, RequestHandler};
+pub use handler::{
+    DefaultRequestHandler, ExtendedAgentCardResolver, RequestAuthorizer, RequestHandler,
+};
 pub use middleware::{CallContext, CallInterceptor, InterceptedHandler, ServiceParams, User};
-pub use push::{HttpPushSender, InMemoryPushConfigStore, PushConfigStore};
+pub use push::{HttpPushSender, HttpPushSenderConfig, InMemoryPushConfigStore, PushConfigStore};
 pub use task_store::{InMemoryTaskStore, TaskStore};
+
+/// Build an `INTERNAL_ERROR` whose client-visible message is generic, while
+/// the real cause is logged server-side (BUG-12 / CWE-209).
+///
+/// Call this where the **server itself** failed — a serialization fault, a
+/// broken invariant — and never at a response boundary. A2A gives an
+/// `AgentExecutor` no code other than `INTERNAL_ERROR` to report its own
+/// failure with (`error_code` has nothing between `INVALID_AGENT_RESPONSE`
+/// and the JSON-RPC generics), and `A2AError` carries no marker for where an
+/// error came from. Sanitizing by code at the boundary therefore cannot tell
+/// a serialization fault from an agent saying why it failed, and would
+/// replace both with "Internal error".
+pub(crate) fn sanitized_internal_error(detail: impl std::fmt::Display) -> a2a::A2AError {
+    tracing::error!(error = %detail, "internal error; returning a generic message to the client");
+    a2a::A2AError::internal("Internal error")
+}
 
 #[cfg(test)]
 pub(crate) mod test_util {

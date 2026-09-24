@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -12,14 +13,18 @@ use crate::types::{ProtocolVersion, TRANSPORT_PROTOCOL_GRPC, TransportProtocol};
 
 /// Self-describing manifest for an agent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCard {
     pub name: String,
+    #[serde(default)]
     pub description: String,
     pub version: String,
     pub supported_interfaces: Vec<AgentInterface>,
     pub capabilities: AgentCapabilities,
+    #[serde(default)]
     pub default_input_modes: Vec<String>,
+    #[serde(default)]
     pub default_output_modes: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_vec_null_as_default")]
     pub skills: Vec<AgentSkill>,
@@ -133,6 +138,7 @@ where
 
 /// A URL + protocol binding combination for reaching the agent.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct AgentInterface {
     pub url: String,
     pub protocol_binding: TransportProtocol,
@@ -211,6 +217,7 @@ impl<'de> Deserialize<'de> for AgentInterface {
 
 /// Information about the agent's service provider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentProvider {
     pub organization: String,
@@ -223,6 +230,7 @@ pub struct AgentProvider {
 
 /// Optional capabilities supported by an agent.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +252,7 @@ pub struct AgentCapabilities {
 
 /// A protocol extension supported by the agent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentExtension {
     pub uri: String,
@@ -255,6 +264,7 @@ pub struct AgentExtension {
     pub required: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "fuzzing", arbitrary(default))]
     pub params: Option<HashMap<String, Value>>,
 }
 
@@ -264,6 +274,7 @@ pub struct AgentExtension {
 
 /// A distinct capability or function that an agent can perform.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSkill {
     pub id: String,
@@ -294,6 +305,7 @@ pub struct AgentSkill {
 
 /// A security scheme for authorizing requests, following OpenAPI 3.0.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum SecurityScheme {
     ApiKey(ApiKeySecurityScheme),
     HttpAuth(HttpAuthSecurityScheme),
@@ -353,6 +365,7 @@ impl<'de> Deserialize<'de> for SecurityScheme {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct ApiKeySecurityScheme {
     pub location: String,
@@ -362,6 +375,7 @@ pub struct ApiKeySecurityScheme {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct HttpAuthSecurityScheme {
     pub scheme: String,
@@ -372,6 +386,7 @@ pub struct HttpAuthSecurityScheme {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct OAuth2SecurityScheme {
     pub flows: OAuthFlows,
@@ -382,6 +397,7 @@ pub struct OAuth2SecurityScheme {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct OpenIdConnectSecurityScheme {
     pub open_id_connect_url: String,
@@ -390,6 +406,7 @@ pub struct OpenIdConnectSecurityScheme {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct MutualTlsSecurityScheme {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -401,6 +418,7 @@ pub struct MutualTlsSecurityScheme {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum OAuthFlows {
     AuthorizationCode(AuthorizationCodeOAuthFlow),
     ClientCredentials(ClientCredentialsOAuthFlow),
@@ -454,6 +472,7 @@ impl<'de> Deserialize<'de> for OAuthFlows {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationCodeOAuthFlow {
     pub authorization_url: String,
@@ -466,6 +485,7 @@ pub struct AuthorizationCodeOAuthFlow {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct ClientCredentialsOAuthFlow {
     pub token_url: String,
@@ -475,6 +495,7 @@ pub struct ClientCredentialsOAuthFlow {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceCodeOAuthFlow {
     pub device_authorization_url: String,
@@ -485,6 +506,7 @@ pub struct DeviceCodeOAuthFlow {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct ImplicitOAuthFlow {
     pub authorization_url: String,
@@ -494,6 +516,7 @@ pub struct ImplicitOAuthFlow {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct PasswordOAuthFlow {
     pub token_url: String,
@@ -515,11 +538,13 @@ pub type SecurityRequirement = HashMap<String, Vec<String>>;
 
 /// JWS signature for an AgentCard (RFC 7515).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCardSignature {
     pub protected: String,
     pub signature: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "fuzzing", arbitrary(default))]
     pub header: Option<HashMap<String, Value>>,
 }
 
@@ -629,6 +654,31 @@ mod tests {
 
         let card: AgentCard = serde_json::from_value(json).unwrap();
         assert!(card.skills.is_empty());
+    }
+
+    /// #275 (SHOULD-level): `description`, `defaultInputModes` and
+    /// `defaultOutputModes` should default when absent rather than failing
+    /// deserialization outright.
+    #[test]
+    fn test_agent_card_deserialize_defaults_optional_fields() {
+        let json = serde_json::json!({
+            "name": "Test Agent",
+            "version": "1.0.0",
+            "supportedInterfaces": [
+                {
+                    "url": "http://localhost:3000",
+                    "protocolBinding": "JSONRPC",
+                    "protocolVersion": crate::VERSION
+                }
+            ],
+            "capabilities": {},
+            "skills": []
+        });
+
+        let card: AgentCard = serde_json::from_value(json).unwrap();
+        assert_eq!(card.description, "");
+        assert!(card.default_input_modes.is_empty());
+        assert!(card.default_output_modes.is_empty());
     }
 
     #[test]

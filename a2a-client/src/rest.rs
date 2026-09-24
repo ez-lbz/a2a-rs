@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
@@ -13,6 +14,7 @@ use crate::push_config_compat::{
     deserialize_task_push_notification_config,
 };
 use crate::transport::{ServiceParams, Transport, TransportFactory};
+use crate::wire;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
 const REST_STREAM_MESSAGE_PATH: &str = "/message:stream";
@@ -78,15 +80,17 @@ impl RestTransport {
     }
 
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response, A2AError> {
-        builder
-            .send()
-            .await
-            .map_err(|e| A2AError::internal(format!("HTTP request failed: {e}")))
+        // Every REST request goes through here, so wire logging for this
+        // binding needs exactly one call site.
+        wire::send(&self.client, builder).await
     }
 
     async fn into_rest_error(resp: reqwest::Response) -> A2AError {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // A failing response is the one a person reaches for --debug to see,
+        // so log it on the way to being turned into an error.
+        wire::log_response(status, &body);
         parse_rest_error(status, &body)
     }
 
@@ -112,9 +116,10 @@ impl RestTransport {
         if !resp.status().is_success() {
             return Err(Self::into_rest_error(resp).await);
         }
-        let payload = resp
-            .json::<Value>()
+        let body = wire::response_text(resp)
             .await
+            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        let payload = serde_json::from_str::<Value>(&body)
             .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
 
         Ok(payload)
@@ -150,9 +155,10 @@ impl RestTransport {
         if !resp.status().is_success() {
             return Err(Self::into_rest_error(resp).await);
         }
-        let payload = resp
-            .json::<Value>()
+        let body = wire::response_text(resp)
             .await
+            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        let payload = serde_json::from_str::<Value>(&body)
             .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
 
         Ok(payload)
@@ -246,6 +252,25 @@ fn parse_rest_error(status: reqwest::StatusCode, body: &str) -> A2AError {
     )
 }
 
+fn should_retry_subscribe_with_legacy_path(err: &A2AError) -> bool {
+    if matches!(
+        err.code,
+        error_code::METHOD_NOT_FOUND | error_code::UNSUPPORTED_OPERATION
+    ) {
+        return true;
+    }
+
+    if err.code != error_code::INTERNAL_ERROR {
+        return false;
+    }
+
+    let msg = err.message.to_ascii_lowercase();
+    msg.contains("http 404")
+        || msg.contains("http 405")
+        || msg.contains("not found")
+        || msg.contains("method not allowed")
+}
+
 #[async_trait]
 impl Transport for RestTransport {
     async fn send_message(
@@ -326,8 +351,15 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        self.get_streaming(&format!("/tasks/{}:subscribe", req.id), params)
-            .await
+        let canonical_path = format!("/tasks/{}:subscribe", req.id);
+        match self.get_streaming(&canonical_path, params).await {
+            Ok(stream) => Ok(stream),
+            Err(err) if should_retry_subscribe_with_legacy_path(&err) => {
+                self.get_streaming(&format!("/tasks/{}/subscribe", req.id), params)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn create_push_config(
@@ -455,7 +487,93 @@ impl TransportFactory for RestTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_http_request(socket: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        String::from_utf8(buffer).unwrap()
+    }
+
+    async fn spawn_subscribe_fallback_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            let first_request = read_http_request(&mut first_socket).await;
+            assert!(
+                first_request.starts_with("GET /tasks/task-1:subscribe HTTP/1.1"),
+                "unexpected first request: {first_request}"
+            );
+
+            let first_body = json!({
+                "error": {
+                    "code": 404,
+                    "status": "NOT_FOUND",
+                    "message": "not found",
+                    "details": []
+                }
+            })
+            .to_string();
+            let first_response = format!(
+                "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                first_body.len(),
+                first_body,
+            );
+            first_socket
+                .write_all(first_response.as_bytes())
+                .await
+                .unwrap();
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            let second_request = read_http_request(&mut second_socket).await;
+            assert!(
+                second_request.starts_with("GET /tasks/task-1/subscribe HTTP/1.1"),
+                "unexpected second request: {second_request}"
+            );
+
+            let status_update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: "task-1".into(),
+                context_id: "ctx-1".into(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            });
+            let sse_payload =
+                serde_json::to_string(&protojson_conv::to_value(&status_update).unwrap()).unwrap();
+            let second_body = format!("data: {sse_payload}\n\n");
+            let second_response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n{}",
+                second_body.len(),
+                second_body,
+            );
+            second_socket
+                .write_all(second_response.as_bytes())
+                .await
+                .unwrap();
+        });
+
+        format!("http://{addr}")
+    }
 
     #[test]
     fn test_rest_transport_new_strips_trailing_slash() {
@@ -646,6 +764,53 @@ mod tests {
 
         let err = parse_rest_error(reqwest::StatusCode::BAD_REQUEST, &body);
         assert_eq!(err.code, error_code::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn test_should_retry_subscribe_with_legacy_path() {
+        assert!(should_retry_subscribe_with_legacy_path(&A2AError {
+            code: error_code::METHOD_NOT_FOUND,
+            message: "method missing".to_string(),
+            details: None,
+        }));
+
+        assert!(should_retry_subscribe_with_legacy_path(&A2AError {
+            code: error_code::UNSUPPORTED_OPERATION,
+            message: "unsupported".to_string(),
+            details: None,
+        }));
+
+        assert!(should_retry_subscribe_with_legacy_path(&A2AError {
+            code: error_code::INTERNAL_ERROR,
+            message: "HTTP 404: not found".to_string(),
+            details: None,
+        }));
+
+        assert!(!should_retry_subscribe_with_legacy_path(&A2AError {
+            code: error_code::TASK_NOT_FOUND,
+            message: "task not found".to_string(),
+            details: None,
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_falls_back_to_legacy_rest_path() {
+        let base_url = spawn_subscribe_fallback_server().await;
+        let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), base_url);
+
+        let mut stream = Transport::subscribe_to_task(
+            &transport,
+            &ServiceParams::new(),
+            &SubscribeToTaskRequest {
+                id: "task-1".into(),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let item = stream.next().await.unwrap().unwrap();
+        assert!(matches!(item, StreamResponse::StatusUpdate(_)));
     }
 
     #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
